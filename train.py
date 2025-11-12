@@ -51,6 +51,7 @@ from sklearn.metrics import (
     roc_auc_score,
     f1_score,
 )
+from sklearn.inspection import permutation_importance
 
 try:
     import joblib
@@ -203,7 +204,7 @@ def train_and_evaluate(
     out_dir: Path,
     save_models: bool = False,
     show_progress: bool = True,
-) -> List[ModelMetrics]:
+) -> Tuple[List[ModelMetrics], Dict[str, object], Tuple[np.ndarray, np.ndarray]]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     _print_stage("Train/Test Split")
@@ -222,6 +223,7 @@ def train_and_evaluate(
     }
 
     metrics_list: List[ModelMetrics] = []
+    fitted: Dict[str, object] = {}
 
     _print_stage("Training Baseline Models")
     prog_models = SimpleProgress(len(models), label="Models") if show_progress else None
@@ -256,6 +258,7 @@ def train_and_evaluate(
         # Plot confusion matrix
         plot_confusion(y_test, y_pred, class_names, out_dir / f"confusion_matrix_{name}.png", f"Confusion Matrix - {name}")
 
+        fitted[name] = clf
         # Optionally save model
         if save_models and _HAS_JOBLIB:
             joblib.dump(clf, out_dir / f"{name}.joblib")
@@ -292,6 +295,7 @@ def train_and_evaluate(
     mv = attach_cv_scores("voting_soft", voting, X, y, mv, show_progress=show_progress)
     metrics_list.append(mv)
     plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_voting_soft.png", "Confusion Matrix - voting_soft")
+    fitted["voting_soft"] = voting
     if save_models and _HAS_JOBLIB:
         joblib.dump(voting, out_dir / "voting_soft.joblib")
 
@@ -317,6 +321,7 @@ def train_and_evaluate(
     ms = attach_cv_scores("stacking", stacking, X, y, ms, show_progress=show_progress)
     metrics_list.append(ms)
     plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_stacking.png", "Confusion Matrix - stacking")
+    fitted["stacking"] = stacking
     if save_models and _HAS_JOBLIB:
         joblib.dump(stacking, out_dir / "stacking.joblib")
 
@@ -324,7 +329,7 @@ def train_and_evaluate(
     best = max(metrics_list, key=lambda r: r.f1_macro)
     print(f"Best model by f1_macro: {best.name} ({best.f1_macro:.4f})")
 
-    return metrics_list
+    return metrics_list, fitted, (X_test, y_test)
 
 
 def resolve_class_names(label_map_path: Optional[Path], y: np.ndarray) -> List[str]:
@@ -349,15 +354,57 @@ def save_metrics(metrics: List[ModelMetrics], out_dir: Path) -> None:
     df.to_csv(out_dir / "metrics_summary.csv", index=False)
     (out_dir / "metrics_summary.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"Saved metrics to: {out_dir / 'metrics_summary.csv'}")
+    return None
+
+
+def extract_builtin_importance(model, feature_names: List[str]) -> Optional[pd.Series]:
+    try:
+        if hasattr(model, "feature_importances_"):
+            imp = np.asarray(model.feature_importances_, dtype=float)
+            if imp.shape[0] == len(feature_names):
+                return pd.Series(imp, index=feature_names).sort_values(ascending=False)
+        if hasattr(model, "coef_"):
+            coef = np.asarray(model.coef_, dtype=float)
+            if coef.ndim == 1:
+                coef = coef[None, :]
+            imp = np.mean(np.abs(coef), axis=0)
+            if imp.shape[0] == len(feature_names):
+                return pd.Series(imp, index=feature_names).sort_values(ascending=False)
+    except Exception:
+        return None
+    return None
+
+
+def compute_permutation_importance(model, X: np.ndarray, y: np.ndarray, feature_names: List[str], n_repeats: int = 8, random_state: int = 42, scoring: str = "f1_macro") -> Optional[pd.Series]:
+    try:
+        r = permutation_importance(model, X, y, n_repeats=n_repeats, random_state=random_state, scoring=scoring)
+        imp = pd.Series(r.importances_mean, index=feature_names)
+        return imp.sort_values(ascending=False)
+    except Exception:
+        return None
+
+
+def plot_feature_importance(imp: pd.Series, out_path: Path, title: str, top_n: int = 20) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    top = imp.head(top_n)[::-1]
+    plt.figure(figsize=(8, max(5, int(0.35 * len(top)))))
+    sns.barplot(x=top.values, y=top.index, color="#4C78A8")
+    plt.title(title)
+    plt.xlabel("Importance")
+    plt.ylabel("Feature")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train, compare, and ensemble models on tabular image features")
     parser.add_argument("--features-csv", type=str, default="outputs/features_scaled.csv", help="Path to scaled features CSV.")
     parser.add_argument("--label-map", type=str, default="outputs/label_map.json", help="Path to label_map.json (optional).")
-    parser.add_argument("--out-dir", type=str, default="outputs/models", help="Directory to write reports and artifacts.")
+    parser.add_argument("--out-dir", type=str, default="outputs/models", help="Directory to write metrics and artifacts.")
     parser.add_argument("--save-models", action="store_true", help="Serialize trained models with joblib.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress display.")
+    parser.add_argument("--perm-importance", action="store_true", help="Force permutation importance for all models (in addition to built-in where available).")
     args = parser.parse_args()
 
     features_csv = Path(args.features_csv)
@@ -373,10 +420,36 @@ def main():
 
     print(f"Samples: {len(y)} | Features: {len(feature_cols)} | Classes: {len(class_names)}")
     print("Training models and evaluating...")
-    metrics = train_and_evaluate(
+    metrics, models, (X_test, y_test) = train_and_evaluate(
         X, y, class_names, out_dir=out_dir, save_models=args.save_models, show_progress=not args.no_progress
     )
     save_metrics(metrics, out_dir)
+
+    # Interpretability: compute and save feature importance plots (no report)
+    _print_stage("Interpretability: Feature Importance")
+    df_rows = [asdict(m) for m in metrics]
+    dfm = pd.DataFrame(df_rows).sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
+    candidates: List[str] = []
+    if not dfm.empty:
+        candidates.append(dfm.iloc[0]["name"])  # best model
+    for ens in ["voting_soft", "stacking"]:
+        if ens in models:
+            candidates.append(ens)
+
+    seen: set[str] = set()
+    for name in candidates:
+        if name in seen or name not in models:
+            continue
+        seen.add(name)
+        model = models[name]
+        title = f"Feature Importance - {name}"
+        out_path = out_dir / f"feature_importance_{name}.png"
+        imp = extract_builtin_importance(model, feature_cols)
+        if imp is None or args.perm_importance:
+            # fallback to permutation on held-out test set
+            imp = compute_permutation_importance(model, X_test, y_test, feature_cols)
+        if imp is not None:
+            plot_feature_importance(imp, out_path, title)
     print("Done.")
 
 
