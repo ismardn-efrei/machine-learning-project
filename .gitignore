@@ -1,0 +1,7 @@
+.venv/
+mlruns/
+outputs/
+artifacts/
+outputs/**/*.png
+*.joblib
+__pycache__/

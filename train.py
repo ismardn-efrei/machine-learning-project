@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import asdict, dataclass
+from contextlib import nullcontext
 import sys
 import time
 from pathlib import Path
@@ -71,6 +72,26 @@ class ModelMetrics:
     roc_auc_ovr: Optional[float]
     cv_f1_macro_mean: Optional[float]
     cv_f1_macro_std: Optional[float]
+
+
+def log_metrics_to_mlflow(mlflow_client, name: str, metrics: ModelMetrics) -> None:
+    """Log per-model metrics to MLflow (if enabled)."""
+    if not mlflow_client:
+        return
+    payload = {
+        f"{name}_accuracy": metrics.accuracy,
+        f"{name}_balanced_accuracy": metrics.balanced_accuracy,
+        f"{name}_precision_macro": metrics.precision_macro,
+        f"{name}_recall_macro": metrics.recall_macro,
+        f"{name}_f1_macro": metrics.f1_macro,
+    }
+    if metrics.roc_auc_ovr is not None:
+        payload[f"{name}_roc_auc_ovr"] = metrics.roc_auc_ovr
+    if metrics.cv_f1_macro_mean is not None:
+        payload[f"{name}_cv_f1_macro_mean"] = metrics.cv_f1_macro_mean
+    if metrics.cv_f1_macro_std is not None:
+        payload[f"{name}_cv_f1_macro_std"] = metrics.cv_f1_macro_std
+    mlflow_client.log_metrics(payload)
 
 
 def _print_stage(title: str) -> None:
@@ -150,7 +171,7 @@ def compute_metrics(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: 
     )
 
 
-def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str], out_path: Path, title: str) -> None:
+def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str], out_path: Path, title: str) -> Path:
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=False, fmt="d", cmap="Blues")
@@ -165,6 +186,7 @@ def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
+    return out_path
 
 
 def attach_cv_scores(
@@ -204,6 +226,7 @@ def train_and_evaluate(
     out_dir: Path,
     save_models: bool = False,
     show_progress: bool = True,
+    mlflow_client=None,
 ) -> Tuple[List[ModelMetrics], Dict[str, object], Tuple[np.ndarray, np.ndarray]]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -256,12 +279,21 @@ def train_and_evaluate(
         metrics_list.append(m)
 
         # Plot confusion matrix
-        plot_confusion(y_test, y_pred, class_names, out_dir / f"confusion_matrix_{name}.png", f"Confusion Matrix - {name}")
+        cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / f"confusion_matrix_{name}.png", f"Confusion Matrix - {name}")
 
         fitted[name] = clf
         # Optionally save model
+        model_path = None
         if save_models and _HAS_JOBLIB:
-            joblib.dump(clf, out_dir / f"{name}.joblib")
+            model_path = out_dir / f"{name}.joblib"
+            joblib.dump(clf, model_path)
+        if mlflow_client:
+            mlflow_client.log_param(f"{name}_type", clf.__class__.__name__)
+            log_metrics_to_mlflow(mlflow_client, name, m)
+            if cm_path.exists():
+                mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
+            if model_path and model_path.exists():
+                mlflow_client.log_artifact(str(model_path), artifact_path="models")
         if show_progress and prog_models:
             prog_models.update(idx)
     if show_progress and prog_models:
@@ -294,10 +326,20 @@ def train_and_evaluate(
     mv = compute_metrics("voting_soft", y_test, y_pred, y_proba)
     mv = attach_cv_scores("voting_soft", voting, X, y, mv, show_progress=show_progress)
     metrics_list.append(mv)
-    plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_voting_soft.png", "Confusion Matrix - voting_soft")
+    cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_voting_soft.png", "Confusion Matrix - voting_soft")
     fitted["voting_soft"] = voting
     if save_models and _HAS_JOBLIB:
-        joblib.dump(voting, out_dir / "voting_soft.joblib")
+        voting_path = out_dir / "voting_soft.joblib"
+        joblib.dump(voting, voting_path)
+    else:
+        voting_path = None
+    if mlflow_client:
+        mlflow_client.log_param("voting_soft_type", voting.__class__.__name__)
+        log_metrics_to_mlflow(mlflow_client, "voting_soft", mv)
+        if cm_path.exists():
+            mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
+        if voting_path and voting_path.exists():
+            mlflow_client.log_artifact(str(voting_path), artifact_path="models")
 
     _print_stage("Ensemble: Stacking")
     stacking = StackingClassifier(
@@ -320,14 +362,26 @@ def train_and_evaluate(
     ms = compute_metrics("stacking", y_test, y_pred, y_proba)
     ms = attach_cv_scores("stacking", stacking, X, y, ms, show_progress=show_progress)
     metrics_list.append(ms)
-    plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_stacking.png", "Confusion Matrix - stacking")
+    cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_stacking.png", "Confusion Matrix - stacking")
     fitted["stacking"] = stacking
     if save_models and _HAS_JOBLIB:
-        joblib.dump(stacking, out_dir / "stacking.joblib")
+        stacking_path = out_dir / "stacking.joblib"
+        joblib.dump(stacking, stacking_path)
+    else:
+        stacking_path = None
+    if mlflow_client:
+        mlflow_client.log_param("stacking_type", stacking.__class__.__name__)
+        log_metrics_to_mlflow(mlflow_client, "stacking", ms)
+        if cm_path.exists():
+            mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
+        if stacking_path and stacking_path.exists():
+            mlflow_client.log_artifact(str(stacking_path), artifact_path="models")
 
     # Save a classification report for best model (by f1_macro)
     best = max(metrics_list, key=lambda r: r.f1_macro)
     print(f"Best model by f1_macro: {best.name} ({best.f1_macro:.4f})")
+    if mlflow_client:
+        mlflow_client.log_param("best_model", best.name)
 
     return metrics_list, fitted, (X_test, y_test)
 
@@ -345,15 +399,20 @@ def resolve_class_names(label_map_path: Optional[Path], y: np.ndarray) -> List[s
     return names
 
 
-def save_metrics(metrics: List[ModelMetrics], out_dir: Path) -> None:
+def save_metrics(metrics: List[ModelMetrics], out_dir: Path, mlflow_client=None) -> None:
     rows = [asdict(m) for m in metrics]
     df = pd.DataFrame(rows)
     # Sort by f1 macro descending
     df = df.sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
     out_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_dir / "metrics_summary.csv", index=False)
-    (out_dir / "metrics_summary.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
-    print(f"Saved metrics to: {out_dir / 'metrics_summary.csv'}")
+    csv_path = out_dir / "metrics_summary.csv"
+    json_path = out_dir / "metrics_summary.json"
+    df.to_csv(csv_path, index=False)
+    json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+    print(f"Saved metrics to: {csv_path}")
+    if mlflow_client:
+        mlflow_client.log_artifact(str(csv_path), artifact_path="reports")
+        mlflow_client.log_artifact(str(json_path), artifact_path="reports")
     return None
 
 
@@ -384,7 +443,7 @@ def compute_permutation_importance(model, X: np.ndarray, y: np.ndarray, feature_
         return None
 
 
-def plot_feature_importance(imp: pd.Series, out_path: Path, title: str, top_n: int = 20) -> None:
+def plot_feature_importance(imp: pd.Series, out_path: Path, title: str, top_n: int = 20) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     top = imp.head(top_n)[::-1]
     plt.figure(figsize=(8, max(5, int(0.35 * len(top)))))
@@ -395,6 +454,7 @@ def plot_feature_importance(imp: pd.Series, out_path: Path, title: str, top_n: i
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
     plt.close()
+    return out_path
 
 
 def main():
@@ -405,6 +465,10 @@ def main():
     parser.add_argument("--save-models", action="store_true", help="Serialize trained models with joblib.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress display.")
     parser.add_argument("--perm-importance", action="store_true", help="Force permutation importance for all models (in addition to built-in where available).")
+    parser.add_argument("--mlflow", action="store_true", help="Enable MLflow logging for this training run.")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=None, help="Optional MLflow tracking URI (e.g., file:./mlruns).")
+    parser.add_argument("--mlflow-experiment", type=str, default="plant-disease-tabular", help="MLflow experiment name.")
+    parser.add_argument("--mlflow-run-name", type=str, default=None, help="Custom MLflow run name.")
     args = parser.parse_args()
 
     features_csv = Path(args.features_csv)
@@ -414,43 +478,76 @@ def main():
     if not features_csv.exists():
         raise FileNotFoundError(f"Features CSV not found: {features_csv}")
 
+    mlflow_client = None
+    if args.mlflow:
+        try:
+            import mlflow  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on optional dep
+            raise RuntimeError("MLflow logging requested but mlflow is not installed.") from exc
+        if args.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+        if args.mlflow_experiment:
+            mlflow.set_experiment(args.mlflow_experiment)
+        mlflow_client = mlflow
+
     print(f"Loading dataset from: {features_csv}")
     df, X, y, feature_cols = load_dataset(features_csv)
     class_names = resolve_class_names(label_map_path, y)
 
     print(f"Samples: {len(y)} | Features: {len(feature_cols)} | Classes: {len(class_names)}")
-    print("Training models and evaluating...")
-    metrics, models, (X_test, y_test) = train_and_evaluate(
-        X, y, class_names, out_dir=out_dir, save_models=args.save_models, show_progress=not args.no_progress
-    )
-    save_metrics(metrics, out_dir)
+    run_name = args.mlflow_run_name or f"train_{features_csv.stem}"
+    run_context = mlflow_client.start_run(run_name=run_name) if mlflow_client else nullcontext()
 
-    # Interpretability: compute and save feature importance plots (no report)
-    _print_stage("Interpretability: Feature Importance")
-    df_rows = [asdict(m) for m in metrics]
-    dfm = pd.DataFrame(df_rows).sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
-    candidates: List[str] = []
-    if not dfm.empty:
-        candidates.append(dfm.iloc[0]["name"])  # best model
-    for ens in ["voting_soft", "stacking"]:
-        if ens in models:
-            candidates.append(ens)
+    with run_context:
+        if mlflow_client:
+            mlflow_client.log_param("features_csv", str(features_csv.resolve()))
+            mlflow_client.log_param("label_map", str(label_map_path.resolve()) if label_map_path else "none")
+            mlflow_client.log_param("samples", int(len(y)))
+            mlflow_client.log_param("n_features", int(len(feature_cols)))
+            mlflow_client.log_param("n_classes", int(len(class_names)))
+            mlflow_client.log_param("save_models", bool(args.save_models))
+            mlflow_client.log_param("perm_importance", bool(args.perm_importance))
 
-    seen: set[str] = set()
-    for name in candidates:
-        if name in seen or name not in models:
-            continue
-        seen.add(name)
-        model = models[name]
-        title = f"Feature Importance - {name}"
-        out_path = out_dir / f"feature_importance_{name}.png"
-        imp = extract_builtin_importance(model, feature_cols)
-        if imp is None or args.perm_importance:
-            # fallback to permutation on held-out test set
-            imp = compute_permutation_importance(model, X_test, y_test, feature_cols)
-        if imp is not None:
-            plot_feature_importance(imp, out_path, title)
-    print("Done.")
+        print("Training models and evaluating...")
+        metrics, models, (X_test, y_test) = train_and_evaluate(
+            X,
+            y,
+            class_names,
+            out_dir=out_dir,
+            save_models=args.save_models,
+            show_progress=not args.no_progress,
+            mlflow_client=mlflow_client,
+        )
+        save_metrics(metrics, out_dir, mlflow_client=mlflow_client)
+
+        # Interpretability: compute and save feature importance plots (no report)
+        _print_stage("Interpretability: Feature Importance")
+        df_rows = [asdict(m) for m in metrics]
+        dfm = pd.DataFrame(df_rows).sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
+        candidates: List[str] = []
+        if not dfm.empty:
+            candidates.append(dfm.iloc[0]["name"])  # best model
+        for ens in ["voting_soft", "stacking"]:
+            if ens in models:
+                candidates.append(ens)
+
+        seen: set[str] = set()
+        for name in candidates:
+            if name in seen or name not in models:
+                continue
+            seen.add(name)
+            model = models[name]
+            title = f"Feature Importance - {name}"
+            out_path = out_dir / f"feature_importance_{name}.png"
+            imp = extract_builtin_importance(model, feature_cols)
+            if imp is None or args.perm_importance:
+                # fallback to permutation on held-out test set
+                imp = compute_permutation_importance(model, X_test, y_test, feature_cols)
+            if imp is not None:
+                fig_path = plot_feature_importance(imp, out_path, title)
+                if mlflow_client and fig_path.exists():
+                    mlflow_client.log_artifact(str(fig_path), artifact_path="feature_importance")
+        print("Done.")
 
 
 if __name__ == "__main__":
