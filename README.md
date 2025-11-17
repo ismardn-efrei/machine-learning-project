@@ -1,15 +1,15 @@
 ## Machine Learning Project Roadmap
 
 ### 1. Prétraitement + EDA
-- Script: `main.py`
-- Commande type: `./.venv/bin/python main.py --data-dir <PlantVillage>`  
+- Script: `preprocess.py`
+- Commande type: `./.venv/bin/python preprocess.py --data-dir <PlantVillage>`  
   Produit `outputs/features_raw.csv`, `outputs/features_scaled.csv`, les figures EDA et `outputs/label_map.json`.
 
 ### 2. Entraînement et comparaison de modèles
-- Script: `train.py`
+- Script: `train_models.py`
 - Exemple (échantillon 15k pour itérer rapidement) :
   ```
-  ./.venv/bin/python train.py \
+  ./.venv/bin/python train_models.py \
       --features-csv outputs/features_scaled_sample.csv \
       --label-map outputs/label_map.json \
       --out-dir outputs/models \
@@ -18,7 +18,7 @@
 - Résultats: `outputs/models/metrics_summary.{csv,json}`, matrices de confusion, modèles `.joblib`, graphes d’importance.
 - Activer le suivi MLflow :
   ```
-  ./.venv/bin/python train.py \
+  ./.venv/bin/python train_models.py \
       --features-csv outputs/features_scaled.csv \
       --label-map outputs/label_map.json \
       --out-dir outputs/models \
@@ -32,7 +32,7 @@
 - Le meilleur modèle (stacking) + scaler + label map sont copiés dans `artifacts/`.
 - Lancer l’API localement :
   ```
-  ./.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+  ./.venv/bin/uvicorn plant_api:app --host 0.0.0.0 --port 8000
   ```
 - Requête exemple :
   ```bash
@@ -68,7 +68,7 @@
   ```
 
 ### 4. Prochaines étapes
-1. **Run complet MLflow** : relancer `train.py` sur la totalité du dataset (non échantillonné) avec `--mlflow` pour alimenter `mlruns/` et disposer de métriques finales suivies.
+1. **Run complet MLflow** : relancer `train_models.py` sur la totalité du dataset (non échantillonné) avec `--mlflow` pour alimenter `mlruns/` et disposer de métriques finales suivies.
 2. **Pipeline complet** : option pour recalculer les features + scaler + modèle finaux dans un même script (ou orchestrer via `make`/bash).
 3. **Frontend / mini site** : bâtir un client (FastAPI templates / petit frontend) ou documenter les appels pour la démo.
 4. **Rapport/présentation** : synthétiser l’EDA, la comparaison des modèles, l’interprétabilité, l’architecture API/Docker/MLflow, ainsi que le mode d’exécution.

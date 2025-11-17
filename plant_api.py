@@ -49,6 +49,32 @@ SCALER = joblib.load(SCALER_PATH)
 FEATURE_COLUMNS = _load_feature_columns(FEATURES_PATH)
 LABEL_MAP = _load_label_map(LABEL_MAP_PATH)
 
+FRIENDLY_LABELS = {
+    "Pepper__bell___Bacterial_spot": "Pepper (bell) - Bacterial spot",
+    "Pepper__bell___healthy": "Pepper (bell) - Healthy",
+    "Potato___Early_blight": "Potato - Early blight",
+    "Potato___Late_blight": "Potato - Late blight",
+    "Potato___healthy": "Potato - Healthy",
+    "Tomato_Bacterial_spot": "Tomato - Bacterial spot",
+    "Tomato_Early_blight": "Tomato - Early blight",
+    "Tomato_Late_blight": "Tomato - Late blight",
+    "Tomato_Leaf_Mold": "Tomato - Leaf mold",
+    "Tomato_Septoria_leaf_spot": "Tomato - Septoria leaf spot",
+    "Tomato_Spider_mites_Two_spotted_spider_mite": "Tomato - Two-spotted spider mite",
+    "Tomato__Target_Spot": "Tomato - Target spot",
+    "Tomato__Tomato_YellowLeaf__Curl_Virus": "Tomato - Yellow Leaf Curl Virus",
+    "Tomato__Tomato_mosaic_virus": "Tomato - Mosaic virus",
+    "Tomato_healthy": "Tomato - Healthy",
+}
+
+
+def friendly_label(raw: str) -> str:
+    if raw in FRIENDLY_LABELS:
+        return FRIENDLY_LABELS[raw]
+    cleaned = raw.replace("__", " ").replace("_", " ")
+    cleaned = " ".join(cleaned.split())
+    return cleaned.strip().title()
+
 
 def _image_stats(img: Image.Image) -> Dict[str, float]:
     arr = np.asarray(img.convert("RGB"), dtype=np.float32)
@@ -125,7 +151,8 @@ def _predict_from_vector(features: FeatureVector, top_k: int) -> PredictionRespo
     X_scaled = SCALER.transform(X)
 
     pred_id = int(MODEL.predict(X_scaled)[0])
-    label_name = LABEL_MAP.get(pred_id, str(pred_id))
+    raw_label = LABEL_MAP.get(pred_id, str(pred_id))
+    label_name = friendly_label(raw_label)
 
     proba: Optional[np.ndarray] = None
     if hasattr(MODEL, "predict_proba"):
@@ -138,7 +165,10 @@ def _predict_from_vector(features: FeatureVector, top_k: int) -> PredictionRespo
     if proba is not None:
         prob_vals = proba[0]
         pairs = sorted(
-            ((LABEL_MAP.get(i, str(i)), float(p)) for i, p in enumerate(prob_vals)),
+            (
+                (friendly_label(LABEL_MAP.get(i, str(i))), float(p))
+                for i, p in enumerate(prob_vals)
+            ),
             key=lambda t: t[1],
             reverse=True,
         )[:top_k]
@@ -244,7 +274,7 @@ def root() -> str:
                 <input type="file" name="file" accept="image/*" required />
                 <button type="submit" id="btnSubmit">Predict disease</button>
             </form>
-            <div class="hint">Les résultats s'affichent ici. Vous pouvez aussi appeler l’API JSON sur <code>/predict</code>.</div>
+            <div class="hint">Results will appear below. You can also call the JSON API at <code>/predict</code>.</div>
             <div id="result">
                 <div id="label"></div>
                 <ul id="probs"></ul>
@@ -262,13 +292,13 @@ def root() -> str:
             event.preventDefault();
             const fileInput = form.querySelector('input[type="file"]');
             if (!fileInput.files.length) {
-                alert("Merci de sélectionner une image.");
+                alert("Please select an image first.");
                 return;
             }
             const data = new FormData();
             data.append("file", fileInput.files[0]);
             btn.disabled = true;
-            btn.textContent = "Analyse en cours...";
+            btn.textContent = "Analyzing...";
             resultBox.style.display = "none";
 
             try {
@@ -280,18 +310,18 @@ def root() -> str:
                     throw new Error(await response.text());
                 }
                 const json = await response.json();
-                labelEl.textContent = `Classe prédite : ${json.label_name} (id: ${json.label_id})`;
+                labelEl.textContent = `Predicted class: ${json.label_name} (id: ${json.label_id})`;
                 probsEl.innerHTML = "";
                 if (json.probabilities) {
                     Object.entries(json.probabilities).forEach(([label, prob]) => {
                         const li = document.createElement("li");
-                        li.textContent = `${label} — ${(prob * 100).toFixed(2)}%`;
+                        li.textContent = `${label} : ${(prob * 100).toFixed(2)}%`;
                         probsEl.appendChild(li);
                     });
                 }
                 resultBox.style.display = "block";
             } catch (err) {
-                alert("Erreur pendant la prédiction : " + err);
+                alert("Prediction failed: " + err);
             } finally {
                 btn.disabled = false;
                 btn.textContent = "Predict disease";
