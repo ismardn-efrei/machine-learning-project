@@ -1,64 +1,35 @@
-"""
-Model Training, Comparison, and Ensembling for the Plant Disease tabular features.
-
-This script loads the precomputed features CSV (scaled) and trains multiple
-classifiers, evaluates them on a held-out test set, and experiments with
-ensemble methods (Voting and Stacking). Results and optional model artifacts
-are saved under the specified output directory.
-
-Usage examples:
-  python train_models.py                                 # uses defaults under outputs/
-  python train_models.py --features-csv outputs/features_scaled.csv \
-                         --label-map outputs/label_map.json \
-                         --out-dir outputs/models
-
-Outputs (under --out-dir, default: outputs/models):
-  - metrics_summary.csv         : Table of metrics per model
-  - metrics_summary.json        : Same info in JSON
-  - confusion_matrix_<model>.png: Confusion matrix heatmaps for each model
-  - <model>.joblib              : Optional serialized models (enable with --save-models)
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+import math
 from contextlib import nullcontext
-import sys
-import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
-import matplotlib.pyplot as plt
 import seaborn as sns
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.base import clone
+import torch
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
-    precision_recall_fscore_support,
-    classification_report,
     confusion_matrix,
+    precision_recall_fscore_support,
     roc_auc_score,
-    f1_score,
 )
-from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
+# 1. IMPORTATION DE MLFLOW (simplification de la logique)
 try:
-    import joblib
-    _HAS_JOBLIB = True
-except Exception:
-    _HAS_JOBLIB = False
+    import mlflow
+except ImportError:
+    mlflow = None
+# -------------------------------------------------------------
 
 
 @dataclass
@@ -70,94 +41,142 @@ class ModelMetrics:
     recall_macro: float
     f1_macro: float
     roc_auc_ovr: Optional[float]
-    cv_f1_macro_mean: Optional[float]
-    cv_f1_macro_std: Optional[float]
 
 
-def log_metrics_to_mlflow(mlflow_client, name: str, metrics: ModelMetrics) -> None:
-    """Log per-model metrics to MLflow (if enabled)."""
-    if not mlflow_client:
-        return
-    payload = {
-        f"{name}_accuracy": metrics.accuracy,
-        f"{name}_balanced_accuracy": metrics.balanced_accuracy,
-        f"{name}_precision_macro": metrics.precision_macro,
-        f"{name}_recall_macro": metrics.recall_macro,
-        f"{name}_f1_macro": metrics.f1_macro,
-    }
-    if metrics.roc_auc_ovr is not None:
-        payload[f"{name}_roc_auc_ovr"] = metrics.roc_auc_ovr
-    if metrics.cv_f1_macro_mean is not None:
-        payload[f"{name}_cv_f1_macro_mean"] = metrics.cv_f1_macro_mean
-    if metrics.cv_f1_macro_std is not None:
-        payload[f"{name}_cv_f1_macro_std"] = metrics.cv_f1_macro_std
-    mlflow_client.log_metrics(payload)
+@dataclass
+class ModelConfig:
+    name: str
+    hidden_dims: List[int]
+    dropout: float = 0.2
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    batch_size: int = 256
+    epochs: int = 30
 
 
-def _print_stage(title: str) -> None:
-    print(f"\n[Stage] {title}")
-    sys.stdout.flush()
+class MLP(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, hidden_dims: List[int], dropout: float) -> None:
+        super().__init__()
+        layers: List[nn.Module] = []
+        prev = input_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev = h
+        layers.append(nn.Linear(prev, num_classes))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
-class SimpleProgress:
-    def __init__(self, total: int, label: str = "", width: int = 30, stream = sys.stdout):
-        self.total = max(1, int(total))
-        self.label = label
-        self.width = max(10, int(width))
-        self.stream = stream
-        self.current = 0
-        self._last_print_len = 0
-
-    def _render(self, current: int) -> str:
-        frac = min(1.0, max(0.0, current / self.total))
-        filled = int(self.width * frac)
-        bar = "#" * filled + "-" * (self.width - filled)
-        pct = int(frac * 100)
-        return f"{self.label} [{bar}] {current}/{self.total} ({pct}%)"
-
-    def update(self, current: int) -> None:
-        self.current = max(0, min(current, self.total))
-        line = self._render(self.current)
-        # Clear previous line if shorter/longer
-        self.stream.write("\r" + line + " " * max(0, self._last_print_len - len(line)))
-        self.stream.flush()
-        self._last_print_len = len(line)
-
-    def increment(self, step: int = 1) -> None:
-        self.update(self.current + step)
-
-    def done(self) -> None:
-        self.update(self.total)
-        self.stream.write("\n")
-        self.stream.flush()
+def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str], out_path: Path, title: str) -> None:
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=False, fmt="d", cmap="Blues")
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    if len(class_names) <= 30:
+        ticks = np.arange(len(class_names)) + 0.5
+        plt.xticks(ticks, class_names, rotation=90)
+        plt.yticks(ticks, class_names, rotation=0)
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
 
 
-def load_dataset(features_csv: Path, label_col: str = "label_id") -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, List[str]]:
+def load_dataset(features_csv: Path, label_map_path: Optional[Path]) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
     df = pd.read_csv(features_csv)
+    label_col = "label_id"
     if label_col not in df.columns:
-        raise ValueError(f"Label column '{label_col}' not found in {features_csv}")
+        raise ValueError("Expected a 'label_id' column in the features CSV.")
+    feature_cols = [c for c in df.columns if c not in {"label_id", "label", "path"}]
+    X = df[feature_cols].values.astype(np.float32)
+    y = df[label_col].values.astype(int)
+    if label_map_path and label_map_path.exists():
+        label_map = json.loads(label_map_path.read_text(encoding="utf-8"))
+        class_names = [label_map.get(str(i), str(i)) for i in range(int(np.max(y)) + 1)]
+    else:
+        class_names = [str(i) for i in range(int(np.max(y)) + 1)]
+    return X, y, feature_cols, class_names
 
-    # X = numeric columns excluding the label
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [c for c in numeric_cols if c != label_col]
-    X = df[feature_cols].values
-    y = df[label_col].astype(int).values
-    return df, X, y, feature_cols
+
+def split_dataset(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    val_ratio = 0.1 / 0.8  # 10% of the original data from train split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=val_ratio, random_state=42, stratify=y_trainval
+    )
+    return X_train, y_train, X_val, y_val, X_test, y_test
 
 
-def compute_metrics(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: Optional[np.ndarray] = None) -> ModelMetrics:
+def compute_class_weights(y: np.ndarray, num_classes: int) -> np.ndarray:
+    counts = np.bincount(y, minlength=num_classes).astype(np.float32)
+    counts[counts == 0] = 1.0
+    inv = 1.0 / counts
+    weights = inv / inv.sum() * num_classes
+    return weights
+
+
+def make_loaders_from_splits(
+    splits: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    batch_size: int,
+    balance_strategy: str,
+    class_weights: Optional[np.ndarray] = None,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    X_train, y_train, X_val, y_val, X_test, y_test = splits
+
+    def data_loader(data_x: np.ndarray, data_y: np.ndarray, shuffle: bool = False, sampler=None) -> DataLoader:
+        dataset = TensorDataset(torch.from_numpy(data_x), torch.from_numpy(data_y))
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle if sampler is None else False, sampler=sampler)
+
+    sampler = None
+    if balance_strategy in {"sampler", "both"} and class_weights is not None:
+        sample_weights = class_weights[y_train]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.float32),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
+    train_loader = data_loader(X_train, y_train, shuffle=True, sampler=sampler)
+    val_loader = data_loader(X_val, y_val, shuffle=False)
+    test_loader = data_loader(X_test, y_test, shuffle=False)
+    return train_loader, val_loader, test_loader
+
+
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    model.eval()
+    all_logits: List[torch.Tensor] = []
+    all_labels: List[torch.Tensor] = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            logits = model(xb)
+            all_logits.append(logits.cpu())
+            all_labels.append(yb)
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0).numpy()
+    probs = torch.softmax(logits, dim=1).numpy()
+    preds = probs.argmax(axis=1)
+    return labels, preds, probs
+
+
+def compute_metrics(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> ModelMetrics:
     acc = accuracy_score(y_true, y_pred)
     bacc = balanced_accuracy_score(y_true, y_pred)
     prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
-
     roc_auc = None
-    if y_proba is not None:
-        try:
-            # Multiclass One-vs-Rest AUC if probabilities available
-            roc_auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr"))
-        except Exception:
-            roc_auc = None
-
+    try:
+        roc_auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr"))
+    except Exception:
+        roc_auc = None
     return ModelMetrics(
         name=name,
         accuracy=float(acc),
@@ -166,388 +185,303 @@ def compute_metrics(name: str, y_true: np.ndarray, y_pred: np.ndarray, y_proba: 
         recall_macro=float(rec),
         f1_macro=float(f1),
         roc_auc_ovr=roc_auc,
-        cv_f1_macro_mean=None,
-        cv_f1_macro_std=None,
     )
 
 
-def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, class_names: List[str], out_path: Path, title: str) -> Path:
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=False, fmt="d", cmap="Blues")
-    plt.title(title)
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    # Optionally limit tick labels if there are many classes
-    if len(class_names) <= 30:
-        plt.xticks(ticks=np.arange(len(class_names)) + 0.5, labels=class_names, rotation=90)
-        plt.yticks(ticks=np.arange(len(class_names)) + 0.5, labels=class_names, rotation=0)
-    plt.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    return out_path
-
-
-def attach_cv_scores(
-    name: str,
-    estimator,
-    X: np.ndarray,
-    y: np.ndarray,
-    metrics: ModelMetrics,
-    show_progress: bool = False,
-) -> ModelMetrics:
-    try:
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-        scores: List[float] = []
-        prog = SimpleProgress(cv.get_n_splits(), label=f"CV {name}") if show_progress else None
-        for i, (train_idx, valid_idx) in enumerate(cv.split(X, y), start=1):
-            est = clone(estimator)
-            est.fit(X[train_idx], y[train_idx])
-            y_pred = est.predict(X[valid_idx])
-            score = f1_score(y[valid_idx], y_pred, average="macro", zero_division=0)
-            scores.append(score)
-            if prog:
-                prog.update(i)
-        if prog:
-            prog.done()
-        metrics.cv_f1_macro_mean = float(np.mean(scores)) if len(scores) else None
-        metrics.cv_f1_macro_std = float(np.std(scores)) if len(scores) else None
-    except Exception:
-        metrics.cv_f1_macro_mean = None
-        metrics.cv_f1_macro_std = None
-    return metrics
-
-
-def train_and_evaluate(
-    X: np.ndarray,
-    y: np.ndarray,
-    class_names: List[str],
-    out_dir: Path,
-    save_models: bool = False,
-    show_progress: bool = True,
-    mlflow_client=None,
-) -> Tuple[List[ModelMetrics], Dict[str, object], Tuple[np.ndarray, np.ndarray]]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    _print_stage("Train/Test Split")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    # Define base models
-    models: Dict[str, object] = {
-        "logreg": LogisticRegression(max_iter=1000, n_jobs=None),
-        "decision_tree": DecisionTreeClassifier(random_state=42),
-        "random_forest": RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=None),
-        "svc_rbf": SVC(kernel="rbf", probability=True, random_state=42),
-        "knn": KNeighborsClassifier(n_neighbors=9),
-        "gbc": GradientBoostingClassifier(random_state=42),
-    }
-
-    metrics_list: List[ModelMetrics] = []
-    fitted: Dict[str, object] = {}
-
-    _print_stage("Training Baseline Models")
-    prog_models = SimpleProgress(len(models), label="Models") if show_progress else None
-    for idx, (name, clf) in enumerate(models.items(), start=1):
-        print(f"- Fitting: {name}")
-        clf.fit(X_train, y_train)
-        if show_progress and prog_models:
-            prog_models.update(idx - 0.4)
-        y_pred = clf.predict(X_test)
-
-        y_proba = None
-        if hasattr(clf, "predict_proba"):
-            try:
-                y_proba = clf.predict_proba(X_test)
-            except Exception:
-                y_proba = None
-        elif hasattr(clf, "decision_function"):
-            try:
-                # Convert decision scores to pseudo-probabilities via softmax
-                scores = clf.decision_function(X_test)
-                if scores.ndim == 1:
-                    scores = np.vstack([-scores, scores]).T
-                e = np.exp(scores - np.max(scores, axis=1, keepdims=True))
-                y_proba = e / np.sum(e, axis=1, keepdims=True)
-            except Exception:
-                y_proba = None
-
-        m = compute_metrics(name, y_test, y_pred, y_proba)
-        m = attach_cv_scores(name, clf, X, y, m, show_progress=show_progress)
-        metrics_list.append(m)
-
-        # Plot confusion matrix
-        cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / f"confusion_matrix_{name}.png", f"Confusion Matrix - {name}")
-
-        fitted[name] = clf
-        # Optionally save model
-        model_path = None
-        if save_models and _HAS_JOBLIB:
-            model_path = out_dir / f"{name}.joblib"
-            joblib.dump(clf, model_path)
-        if mlflow_client:
-            mlflow_client.log_param(f"{name}_type", clf.__class__.__name__)
-            log_metrics_to_mlflow(mlflow_client, name, m)
-            if cm_path.exists():
-                mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
-            if model_path and model_path.exists():
-                mlflow_client.log_artifact(str(model_path), artifact_path="models")
-        if show_progress and prog_models:
-            prog_models.update(idx)
-    if show_progress and prog_models:
-        prog_models.done()
-
-    # Ensembles: Voting (soft) and Stacking
-    _print_stage("Ensemble: Voting (soft)")
-    voting = VotingClassifier(
-        estimators=[
-            ("logreg", LogisticRegression(max_iter=1000)),
-            ("rf", RandomForestClassifier(n_estimators=200, random_state=42)),
-            ("svc", SVC(kernel="rbf", probability=True, random_state=42)),
-        ],
-        voting="soft",
-        weights=None,
-        n_jobs=None,
-        flatten_transform=True,
-    )
-    if show_progress:
-        pv = SimpleProgress(3, label="Voting fit")
-    voting.fit(X_train, y_train)
-    if show_progress:
-        pv.done()
-    y_pred = voting.predict(X_test)
-    y_proba = None
-    try:
-        y_proba = voting.predict_proba(X_test)
-    except Exception:
-        y_proba = None
-    mv = compute_metrics("voting_soft", y_test, y_pred, y_proba)
-    mv = attach_cv_scores("voting_soft", voting, X, y, mv, show_progress=show_progress)
-    metrics_list.append(mv)
-    cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_voting_soft.png", "Confusion Matrix - voting_soft")
-    fitted["voting_soft"] = voting
-    if save_models and _HAS_JOBLIB:
-        voting_path = out_dir / "voting_soft.joblib"
-        joblib.dump(voting, voting_path)
-    else:
-        voting_path = None
-    if mlflow_client:
-        mlflow_client.log_param("voting_soft_type", voting.__class__.__name__)
-        log_metrics_to_mlflow(mlflow_client, "voting_soft", mv)
-        if cm_path.exists():
-            mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
-        if voting_path and voting_path.exists():
-            mlflow_client.log_artifact(str(voting_path), artifact_path="models")
-
-    _print_stage("Ensemble: Stacking")
-    stacking = StackingClassifier(
-        estimators=[
-            ("logreg", LogisticRegression(max_iter=1000)),
-            ("rf", RandomForestClassifier(n_estimators=200, random_state=42)),
-            ("svc", SVC(kernel="rbf", probability=True, random_state=42)),
-        ],
-        final_estimator=LogisticRegression(max_iter=1000),
-        passthrough=False,
-        n_jobs=None,
-    )
-    stacking.fit(X_train, y_train)
-    y_pred = stacking.predict(X_test)
-    y_proba = None
-    try:
-        y_proba = stacking.predict_proba(X_test)
-    except Exception:
-        y_proba = None
-    ms = compute_metrics("stacking", y_test, y_pred, y_proba)
-    ms = attach_cv_scores("stacking", stacking, X, y, ms, show_progress=show_progress)
-    metrics_list.append(ms)
-    cm_path = plot_confusion(y_test, y_pred, class_names, out_dir / "confusion_matrix_stacking.png", "Confusion Matrix - stacking")
-    fitted["stacking"] = stacking
-    if save_models and _HAS_JOBLIB:
-        stacking_path = out_dir / "stacking.joblib"
-        joblib.dump(stacking, stacking_path)
-    else:
-        stacking_path = None
-    if mlflow_client:
-        mlflow_client.log_param("stacking_type", stacking.__class__.__name__)
-        log_metrics_to_mlflow(mlflow_client, "stacking", ms)
-        if cm_path.exists():
-            mlflow_client.log_artifact(str(cm_path), artifact_path="confusion_matrices")
-        if stacking_path and stacking_path.exists():
-            mlflow_client.log_artifact(str(stacking_path), artifact_path="models")
-
-    # Save a classification report for best model (by f1_macro)
-    best = max(metrics_list, key=lambda r: r.f1_macro)
-    print(f"Best model by f1_macro: {best.name} ({best.f1_macro:.4f})")
-    if mlflow_client:
-        mlflow_client.log_param("best_model", best.name)
-
-    return metrics_list, fitted, (X_test, y_test)
-
-
-def resolve_class_names(label_map_path: Optional[Path], y: np.ndarray) -> List[str]:
-    n_classes = int(np.max(y)) + 1
-    names = [str(i) for i in range(n_classes)]
-    if label_map_path and label_map_path.exists():
-        try:
-            m = json.loads(label_map_path.read_text(encoding="utf-8"))
-            # keys may be strings representing ints
-            names = [m.get(str(i), names[i]) for i in range(n_classes)]
-        except Exception:
-            pass
-    return names
-
-
-def save_metrics(metrics: List[ModelMetrics], out_dir: Path, mlflow_client=None) -> None:
+def save_metrics(metrics: List[ModelMetrics], out_dir: Path) -> None:
     rows = [asdict(m) for m in metrics]
-    df = pd.DataFrame(rows)
-    # Sort by f1 macro descending
-    df = df.sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
+    df = pd.DataFrame(rows).sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "metrics_summary.csv"
     json_path = out_dir / "metrics_summary.json"
     df.to_csv(csv_path, index=False)
     json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"Saved metrics to: {csv_path}")
-    if mlflow_client:
-        mlflow_client.log_artifact(str(csv_path), artifact_path="reports")
-        mlflow_client.log_artifact(str(json_path), artifact_path="reports")
-    return None
 
 
-def extract_builtin_importance(model, feature_names: List[str]) -> Optional[pd.Series]:
-    try:
-        if hasattr(model, "feature_importances_"):
-            imp = np.asarray(model.feature_importances_, dtype=float)
-            if imp.shape[0] == len(feature_names):
-                return pd.Series(imp, index=feature_names).sort_values(ascending=False)
-        if hasattr(model, "coef_"):
-            coef = np.asarray(model.coef_, dtype=float)
-            if coef.ndim == 1:
-                coef = coef[None, :]
-            imp = np.mean(np.abs(coef), axis=0)
-            if imp.shape[0] == len(feature_names):
-                return pd.Series(imp, index=feature_names).sort_values(ascending=False)
-    except Exception:
-        return None
-    return None
+def compute_permutation_importance_nn(
+    model: nn.Module,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    device: torch.device,
+    repeats: int = 5,
+) -> np.ndarray:
+    baseline_dataset = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
+    baseline_loader = DataLoader(baseline_dataset, batch_size=512, shuffle=False)
+    y_base, preds_base, probs_base = evaluate_model(model, baseline_loader, device)
+    baseline_metrics = compute_metrics("baseline", y_base, preds_base, probs_base)
+    baseline_f1 = baseline_metrics.f1_macro
+    rng = np.random.default_rng(42)
+    drops = np.zeros(X_test.shape[1], dtype=float)
+
+    for idx in range(X_test.shape[1]):
+        drop_scores: List[float] = []
+        for _ in range(repeats):
+            X_perm = X_test.copy()
+            rng.shuffle(X_perm[:, idx])
+            perm_loader = DataLoader(
+                TensorDataset(torch.from_numpy(X_perm), torch.from_numpy(y_test)),
+                batch_size=512,
+                shuffle=False,
+            )
+            y_perm, preds_perm, probs_perm = evaluate_model(model, perm_loader, device)
+            perm_metrics = compute_metrics("perm", y_perm, preds_perm, probs_perm)
+            drop_scores.append(baseline_f1 - perm_metrics.f1_macro)
+        drops[idx] = float(np.mean(drop_scores))
+    return drops
 
 
-def compute_permutation_importance(model, X: np.ndarray, y: np.ndarray, feature_names: List[str], n_repeats: int = 8, random_state: int = 42, scoring: str = "f1_macro") -> Optional[pd.Series]:
-    try:
-        r = permutation_importance(model, X, y, n_repeats=n_repeats, random_state=random_state, scoring=scoring)
-        imp = pd.Series(r.importances_mean, index=feature_names)
-        return imp.sort_values(ascending=False)
-    except Exception:
-        return None
-
-
-def plot_feature_importance(imp: pd.Series, out_path: Path, title: str, top_n: int = 20) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    top = imp.head(top_n)[::-1]
-    plt.figure(figsize=(8, max(5, int(0.35 * len(top)))))
-    sns.barplot(x=top.values, y=top.index, color="#4C78A8")
+def plot_feature_importance(importance: np.ndarray, feature_names: List[str], out_path: Path, title: str, top_n: int = 20) -> None:
+    series = pd.Series(importance, index=feature_names).sort_values(ascending=False)
+    if top_n:
+        series = series.head(top_n)
+    plt.figure(figsize=(8, max(4, int(0.4 * len(series)))))
+    sns.barplot(x=series.values, y=series.index, color="#4C78A8")
     plt.title(title)
-    plt.xlabel("Importance")
+    plt.xlabel("F1 drop when shuffled")
     plt.ylabel("Feature")
     plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150)
     plt.close()
-    return out_path
+    
+    
+def train_single_model(
+    cfg: ModelConfig,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    input_dim: int,
+    num_classes: int,
+    device: torch.device,
+    out_dir: Path,
+    class_names: List[str],
+    save_models: bool,
+    mlflow_client, # Ici, c'est le drapeau 'mlflow_active' (booléen)
+    class_weight_tensor: Optional[torch.Tensor] = None,
+    feature_names: Optional[List[str]] = None,
+    X_test: Optional[np.ndarray] = None,
+    y_test: Optional[np.ndarray] = None,
+    perm_importance: bool = False,
+    perm_repeats: int = 5,
+    perm_max_features: int = 64,
+) -> ModelMetrics:
+    
+    mlflow_active = mlflow_client and mlflow is not None
+        
+    # MODIFICATION CLÉ 1: Démarrer un run imbriqué (nested=True)
+    run_context = mlflow.start_run(run_name=cfg.name, nested=True) if mlflow_active else nullcontext()
+    
+    with run_context:
+        if mlflow_active:
+            mlflow.log_params(
+                {
+                    "model_name": cfg.name,
+                    "hidden_dims": cfg.hidden_dims,
+                    "dropout": cfg.dropout,
+                    "lr": cfg.lr,
+                    "weight_decay": cfg.weight_decay,
+                    "batch_size": cfg.batch_size,
+                    "epochs": cfg.epochs,
+                }
+            )
+        model = MLP(input_dim, num_classes, cfg.hidden_dims, cfg.dropout).to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weight_tensor)
+        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+        best_state = None
+        best_val_f1 = -math.inf
+
+        for epoch in range(1, cfg.epochs + 1):
+            model.train()
+            epoch_loss = 0.0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                optimizer.zero_grad()
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += float(loss.item())
+            avg_loss = epoch_loss / max(1, len(train_loader))
+
+            y_val, preds_val, probs_val = evaluate_model(model, val_loader, device)
+            val_metrics = compute_metrics(cfg.name, y_val, preds_val, probs_val)
+
+            if mlflow_active:
+                mlflow.log_metrics(
+                    {
+                        f"{cfg.name}_train_loss": avg_loss,
+                        f"{cfg.name}_val_f1": val_metrics.f1_macro,
+                    },
+                    step=epoch,
+                )
+
+            if val_metrics.f1_macro > best_val_f1:
+                best_val_f1 = val_metrics.f1_macro
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        y_test, preds_test, probs_test = evaluate_model(model, test_loader, device)
+        metrics = compute_metrics(cfg.name, y_test, preds_test, probs_test)
+
+        if mlflow_active:
+            mlflow.log_metrics(
+                {
+                    f"{cfg.name}_accuracy": metrics.accuracy,
+                    f"{cfg.name}_balanced_accuracy": metrics.balanced_accuracy,
+                    f"{cfg.name}_precision_macro": metrics.precision_macro,
+                    f"{cfg.name}_recall_macro": metrics.recall_macro,
+                    f"{cfg.name}_f1_macro": metrics.f1_macro,
+                }
+            )
+            if metrics.roc_auc_ovr is not None:
+                mlflow.log_metric(f"{cfg.name}_roc_auc", metrics.roc_auc_ovr)
+                
+            # MODIFICATION CLÉ 2: Correction de l'appel mlflow.pytorch.log_model
+            # Utilisation de 'artifact_path' et suppression de 'python_model'
+            mlflow.pytorch.log_model(
+                pytorch_model=model, 
+                artifact_path=cfg.name, 
+            )
+
+
+        cm_path = out_dir / f"confusion_matrix_{cfg.name}.png"
+        plot_confusion(y_test, preds_test, class_names, cm_path, f"Confusion Matrix - {cfg.name}")
+        if mlflow_active:
+            mlflow.log_artifact(str(cm_path), artifact_path="confusion_matrices")
+
+        if perm_importance and feature_names and X_test is not None and y_test is not None:
+            if len(feature_names) > perm_max_features:
+                print(f"[info] Skipping permutation importance for {cfg.name}: {len(feature_names)} features exceed limit ({perm_max_features}).")
+            else:
+                print(f"[info] Computing permutation importance for {cfg.name} ...")
+                importances = compute_permutation_importance_nn(
+                    model, X_test, y_test, device, repeats=perm_repeats
+                )
+                fi_path = out_dir / f"feature_importance_{cfg.name}.png"
+                plot_feature_importance(importances, feature_names, fi_path, f"Feature Importance - {cfg.name}")
+                if mlflow_active:
+                    mlflow.log_artifact(str(fi_path), artifact_path="feature_importance")
+
+        if save_models:
+            model_path = out_dir / f"{cfg.name}.pt"
+            torch.save(model.state_dict(), model_path)
+            if mlflow_active:
+                mlflow.log_artifact(str(model_path), artifact_path="models_pt") 
+
+        return metrics
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train, compare, and ensemble models on tabular image features")
-    parser.add_argument("--features-csv", type=str, default="outputs/features_scaled.csv", help="Path to scaled features CSV.")
-    parser.add_argument("--label-map", type=str, default="outputs/label_map.json", help="Path to label_map.json (optional).")
-    parser.add_argument("--out-dir", type=str, default="outputs/models", help="Directory to write metrics and artifacts.")
-    parser.add_argument("--save-models", action="store_true", help="Serialize trained models with joblib.")
-    parser.add_argument("--no-progress", action="store_true", help="Disable progress display.")
-    parser.add_argument("--perm-importance", action="store_true", help="Force permutation importance for all models (in addition to built-in where available).")
-    parser.add_argument("--mlflow", action="store_true", help="Enable MLflow logging for this training run.")
-    parser.add_argument("--mlflow-tracking-uri", type=str, default=None, help="Optional MLflow tracking URI (e.g., file:./mlruns).")
-    parser.add_argument("--mlflow-experiment", type=str, default="plant-disease-tabular", help="MLflow experiment name.")
-    parser.add_argument("--mlflow-run-name", type=str, default=None, help="Custom MLflow run name.")
+    parser = argparse.ArgumentParser(description="Train neural classifiers on PlantVillage features (GPU-ready)")
+    parser.add_argument("--features-csv", type=str, required=True, help="Path to features CSV (scaled or embeddings).")
+    parser.add_argument("--label-map", type=str, default="outputs/label_map.json", help="Path to label_map.json.")
+    parser.add_argument("--out-dir", type=str, default="outputs/models", help="Directory to store metrics and artifacts.")
+    parser.add_argument("--save-models", action="store_true", help="Save trained PyTorch models (.pt).")
+    parser.add_argument("--mlflow", action="store_true", help="Enable MLflow logging.")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=None, help="MLflow tracking URI (e.g., file:./mlruns).")
+    parser.add_argument("--mlflow-experiment", type=str, default="plant-disease-neural", help="MLflow experiment name.")
+    parser.add_argument("--perm-importance", action="store_true", help="Compute permutation-based feature importance (slow).")
+    parser.add_argument("--perm-repeats", type=int, default=5, help="Number of shuffles per feature for permutation importance.")
+    parser.add_argument("--perm-max-features", type=int, default=64, help="Skip permutation importance if feature count exceeds this limit.")
+    parser.add_argument(
+        "--balance-strategy",
+        type=str,
+        choices=["none", "class_weight", "sampler", "both"],
+        default="none",
+        help="Imbalance handling: use class-weighted loss, weighted sampler, or both.",
+    )
     args = parser.parse_args()
 
     features_csv = Path(args.features_csv)
-    label_map_path = Path(args.label_map) if args.label_map else None
-    out_dir = Path(args.out_dir)
-
     if not features_csv.exists():
         raise FileNotFoundError(f"Features CSV not found: {features_csv}")
 
-    mlflow_client = None
-    if args.mlflow:
-        try:
-            import mlflow  # type: ignore
-        except Exception as exc:  # pragma: no cover - depends on optional dep
-            raise RuntimeError("MLflow logging requested but mlflow is not installed.") from exc
+    label_map_path = Path(args.label_map) if args.label_map else None
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    mlflow_active = args.mlflow and mlflow is not None
+    
+    # 1. GESTION DU CONTEXTE MLFLOW GLOBAL
+    run_context = nullcontext() # Par défaut, pas de contexte
+    if mlflow_active:
         if args.mlflow_tracking_uri:
             mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-        if args.mlflow_experiment:
-            mlflow.set_experiment(args.mlflow_experiment)
-        mlflow_client = mlflow
+        mlflow.set_experiment(args.mlflow_experiment)
+        
+        # Démarrage du RUN PARENT 
+        run_context = mlflow.start_run(run_name="Project_Run_Summary") 
+        mlflow_client = True # Drapau d'activité
 
-    print(f"Loading dataset from: {features_csv}")
-    df, X, y, feature_cols = load_dataset(features_csv)
-    class_names = resolve_class_names(label_map_path, y)
+    # Le reste du code est déplacé à l'intérieur du bloc 'with'
+    with run_context: 
+        X, y, feature_cols, class_names = load_dataset(features_csv, label_map_path)
+        num_classes = len(class_names)
+        input_dim = X.shape[1]
 
-    print(f"Samples: {len(y)} | Features: {len(feature_cols)} | Classes: {len(class_names)}")
-    run_name = args.mlflow_run_name or f"train_{features_csv.stem}"
-    run_context = mlflow_client.start_run(run_name=run_name) if mlflow_client else nullcontext()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+        
+        # Journalisation des paramètres globaux (sous le Run Parent)
+        if mlflow_active:
+            mlflow.log_param("features_csv", str(features_csv.resolve()))
+            mlflow.log_param("label_map", str(label_map_path.resolve()) if label_map_path else "none")
+            mlflow.log_param("samples", int(len(y)))
+            mlflow.log_param("n_features", int(input_dim))
+            mlflow.log_param("n_classes", int(num_classes))
+            mlflow.log_param("balance_strategy", args.balance_strategy)
+        
+        configs = [
+            ModelConfig(name="mlp_small", hidden_dims=[128, 64], dropout=0.2, lr=1e-3, epochs=30, batch_size=256),
+            ModelConfig(name="mlp_medium", hidden_dims=[256, 128, 64], dropout=0.3, lr=1e-3, epochs=35, batch_size=256),
+            ModelConfig(name="mlp_deep", hidden_dims=[512, 256, 128], dropout=0.4, lr=5e-4, epochs=40, batch_size=128),
+        ]
 
-    with run_context:
-        if mlflow_client:
-            mlflow_client.log_param("features_csv", str(features_csv.resolve()))
-            mlflow_client.log_param("label_map", str(label_map_path.resolve()) if label_map_path else "none")
-            mlflow_client.log_param("samples", int(len(y)))
-            mlflow_client.log_param("n_features", int(len(feature_cols)))
-            mlflow_client.log_param("n_classes", int(len(class_names)))
-            mlflow_client.log_param("save_models", bool(args.save_models))
-            mlflow_client.log_param("perm_importance", bool(args.perm_importance))
-
-        print("Training models and evaluating...")
-        metrics, models, (X_test, y_test) = train_and_evaluate(
-            X,
-            y,
-            class_names,
-            out_dir=out_dir,
-            save_models=args.save_models,
-            show_progress=not args.no_progress,
-            mlflow_client=mlflow_client,
+        metrics_all: List[ModelMetrics] = []
+        splits = split_dataset(X, y)
+        X_train, y_train, X_val, y_val, X_test, y_test = splits
+        class_weights_np = compute_class_weights(y_train, num_classes)
+        use_class_weight = args.balance_strategy in {"class_weight", "both"}
+        use_sampler = args.balance_strategy in {"sampler", "both"}
+        sampler_weights = class_weights_np if use_sampler else None
+        class_weight_tensor = (
+            torch.tensor(class_weights_np, dtype=torch.float32, device=device) if use_class_weight else None
         )
-        save_metrics(metrics, out_dir, mlflow_client=mlflow_client)
 
-        # Interpretability: compute and save feature importance plots (no report)
-        _print_stage("Interpretability: Feature Importance")
-        df_rows = [asdict(m) for m in metrics]
-        dfm = pd.DataFrame(df_rows).sort_values(by=["f1_macro", "accuracy"], ascending=[False, False])
-        candidates: List[str] = []
-        if not dfm.empty:
-            candidates.append(dfm.iloc[0]["name"])  # best model
-        for ens in ["voting_soft", "stacking"]:
-            if ens in models:
-                candidates.append(ens)
+        for cfg in configs:
+            print(f"\n=== Training model: {cfg.name} ===")
+            train_loader, val_loader, test_loader = make_loaders_from_splits(
+                splits, cfg.batch_size, args.balance_strategy, sampler_weights
+            )
+            metrics = train_single_model(
+                cfg=cfg,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                input_dim=input_dim,
+                num_classes=num_classes,
+                device=device,
+                out_dir=out_dir,
+                class_names=class_names,
+                save_models=args.save_models,
+                mlflow_client=mlflow_active, # On passe le drapeau
+                class_weight_tensor=class_weight_tensor,
+                feature_names=feature_cols,
+                X_test=X_test,
+                y_test=y_test,
+                perm_importance=args.perm_importance,
+                perm_repeats=args.perm_repeats,
+                perm_max_features=args.perm_max_features,
+            )
+            metrics_all.append(metrics)
 
-        seen: set[str] = set()
-        for name in candidates:
-            if name in seen or name not in models:
-                continue
-            seen.add(name)
-            model = models[name]
-            title = f"Feature Importance - {name}"
-            out_path = out_dir / f"feature_importance_{name}.png"
-            imp = extract_builtin_importance(model, feature_cols)
-            if imp is None or args.perm_importance:
-                # fallback to permutation on held-out test set
-                imp = compute_permutation_importance(model, X_test, y_test, feature_cols)
-            if imp is not None:
-                fig_path = plot_feature_importance(imp, out_path, title)
-                if mlflow_client and fig_path.exists():
-                    mlflow_client.log_artifact(str(fig_path), artifact_path="feature_importance")
-        print("Done.")
+        save_metrics(metrics_all, out_dir)
+    # Le Run Parent se termine ici
 
 
 if __name__ == "__main__":

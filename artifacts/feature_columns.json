@@ -1,0 +1,14 @@
+[
+  "file_size_kb",
+  "width",
+  "height",
+  "aspect_ratio",
+  "mean_r",
+  "mean_g",
+  "mean_b",
+  "std_r",
+  "std_g",
+  "std_b",
+  "brightness_mean",
+  "brightness_std"
+]

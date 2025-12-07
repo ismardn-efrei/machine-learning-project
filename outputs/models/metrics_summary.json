@@ -1,0 +1,29 @@
+[
+  {
+    "name": "mlp_small",
+    "accuracy": 0.9377422480620154,
+    "balanced_accuracy": 0.9408650631905153,
+    "precision_macro": 0.9256241374798893,
+    "recall_macro": 0.9408650631905153,
+    "f1_macro": 0.9324555373642806,
+    "roc_auc_ovr": 0.997699605306962
+  },
+  {
+    "name": "mlp_medium",
+    "accuracy": 0.9348352713178295,
+    "balanced_accuracy": 0.9383369925373785,
+    "precision_macro": 0.9236722922807326,
+    "recall_macro": 0.9383369925373785,
+    "f1_macro": 0.9301421165700766,
+    "roc_auc_ovr": 0.9971875507276856
+  },
+  {
+    "name": "mlp_deep",
+    "accuracy": 0.940406976744186,
+    "balanced_accuracy": 0.9415344960975135,
+    "precision_macro": 0.9307255522838562,
+    "recall_macro": 0.9415344960975135,
+    "f1_macro": 0.9354855426543707,
+    "roc_auc_ovr": 0.9979515083700278
+  }
+]

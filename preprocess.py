@@ -13,6 +13,9 @@ This script will:
 Outputs are saved under `outputs/` by default:
   - outputs/features_raw.csv
   - outputs/features_scaled.csv
+  - outputs/label_map.json
+  - outputs/scaler.joblib
+  - outputs/feature_columns.json
   - outputs/eda/*.png
 
 Usage examples:
@@ -25,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -59,6 +61,14 @@ except Exception as e:  # pragma: no cover
     raise RuntimeError(
         "scikit-learn is required. Please install with: pip install scikit-learn"
     ) from e
+
+try:
+    import joblib
+
+    _HAS_JOBLIB = True
+except Exception:
+    joblib = None
+    _HAS_JOBLIB = False
 
 
 def try_download_with_kagglehub() -> Optional[Path]:
@@ -281,7 +291,7 @@ def eda_plots(df: pd.DataFrame, out_dir: Path) -> None:
         plt.close()
 
 
-def preprocess_and_export(df: pd.DataFrame, out_dir: Path) -> Tuple[Path, Path, Path]:
+def preprocess_and_export(df: pd.DataFrame, out_dir: Path) -> Tuple[Path, Path, Path, Optional[Path], Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Clean: drop obvious NaNs
@@ -309,7 +319,18 @@ def preprocess_and_export(df: pd.DataFrame, out_dir: Path) -> Tuple[Path, Path, 
     df_scaled.to_csv(scaled_csv, index=False)
     map_json.write_text(json.dumps(label_map, indent=2), encoding="utf-8")
 
-    return raw_csv, scaled_csv, map_json
+    scaler_path: Optional[Path]
+    if _HAS_JOBLIB:
+        scaler_path = out_dir / "scaler.joblib"
+        joblib.dump(scaler, scaler_path)
+    else:
+        scaler_path = None
+        print("Warning: joblib is unavailable; scaler will not be saved.")
+
+    feature_cols_path = out_dir / "feature_columns.json"
+    feature_cols_path.write_text(json.dumps(to_scale, indent=2), encoding="utf-8")
+
+    return raw_csv, scaled_csv, map_json, scaler_path, feature_cols_path
 
 
 def main():
@@ -348,12 +369,17 @@ def main():
     eda_plots(df, eda_dir)
 
     print("Preprocessing (encoding + scaling) and exporting CSVs ...")
-    raw_csv, scaled_csv, map_json = preprocess_and_export(df, out_dir)
+    raw_csv, scaled_csv, map_json, scaler_path, feat_cols_path = preprocess_and_export(df, out_dir)
 
     print("Done.")
     print(f"Raw features: {raw_csv}")
     print(f"Scaled features: {scaled_csv}")
     print(f"Label map: {map_json}")
+    if scaler_path is not None:
+        print(f"Scaler: {scaler_path}")
+    else:
+        print("Scaler: <not saved - install joblib to persist the StandardScaler>")
+    print(f"Feature columns: {feat_cols_path}")
     print(f"EDA figures: {eda_dir}")
 
 
